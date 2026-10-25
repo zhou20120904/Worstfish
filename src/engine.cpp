@@ -114,6 +114,14 @@ Engine::Engine(std::optional<std::filesystem::path> path) :
           return std::nullopt;
       }));
 
+    // Takes precedence over Worst Mode when both are enabled.
+    options.add(  //
+      "Self-Mate Mode", Option(false, [this](const Option&) {
+          search_clear();
+          lastSelfMateSide = COLOR_NB;
+          return std::nullopt;
+      }));
+
     options.add("Move Overhead", Option(10, 0, 5000));
 
     options.add("nodestime", Option(0, 0, 10000));
@@ -161,6 +169,18 @@ Engine::perft(const std::string& fen, Depth depth, bool isChess960) {
 void Engine::go(Search::LimitsType& limits) {
     assert(limits.perft == 0);
     verify_network();
+
+    // Self-Mate Mode scores are relative to the side that wants to be mated,
+    // so tables from a search for the other side cannot be reused.
+    if (options["Self-Mate Mode"])
+    {
+        const Color side = pos.side_to_move();
+        if (lastSelfMateSide != COLOR_NB && lastSelfMateSide != side)
+            search_clear();
+        lastSelfMateSide = side;
+    }
+    else
+        lastSelfMateSide = COLOR_NB;
 
     threads.start_thinking(options, pos, states, limits);
 }

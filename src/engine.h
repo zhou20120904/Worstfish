@@ -134,6 +134,10 @@ class Engine {
     Search::SearchManager::UpdateContext  updateContext;
     std::function<void(std::string_view)> onVerifyNetwork;
     std::map<NumaIndex, SharedHistories>  sharedHists;
+
+    // Side that wants to be mated in Self-Mate Mode.
+    // COLOR_NB means no previous self-mate search.
+    Color lastSelfMateSide = COLOR_NB;
 };
 
 }  // namespace Stockfish

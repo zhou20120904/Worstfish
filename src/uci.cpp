@@ -661,7 +661,7 @@ void UCIEngine::on_update_full(const Engine::InfoFull& info, bool showWDL) {
     if (!info.bound.empty())
         ss << " " << info.bound;
 
-    if (showWDL)
+    if (showWDL && !info.wdl.empty())
         ss << " wdl " << info.wdl;
 
     ss << " nodes " << info.nodes        //

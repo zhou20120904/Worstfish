@@ -317,11 +317,16 @@ void ThreadPool::start_thinking(const OptionsMap&  options,
         for (const auto& m : MoveList<ALL>(pos))
             rootMoves.emplace_back(m);
 
-    Tablebases::Config tbConfig = Tablebases::rank_root_moves(options, pos, rootMoves);
+    // Tablebases only describe normal chess outcomes, which are meaningless for
+    // Self-Mate Mode, so probing and root ranking are disabled there.
+    const bool selfMate = options["Self-Mate Mode"];
+
+    Tablebases::Config tbConfig = selfMate ? Tablebases::Config{}
+                                           : Tablebases::rank_root_moves(options, pos, rootMoves);
 
     // Worst Mode searches only the lowest-ranked TB group, with root scores
     // from the opponent's point of view.
-    if (options["Worst Mode"] && tbConfig.rootInTB)
+    if (!selfMate && options["Worst Mode"] && tbConfig.rootInTB)
     {
         for (auto& rm : rootMoves)
         {

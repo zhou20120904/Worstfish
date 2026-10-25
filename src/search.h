@@ -374,6 +374,24 @@ class Worker {
 
     Value evaluate(const Position&);
 
+    // Value of a node without legal moves: checkmate, or stalemate/draw.
+    Value terminal_value(const Position& pos, int ply, bool inCheck) const;
+
+    // Self-Mate Mode: dedicated AND/OR proof search. The self-mate side is an
+    // OR node, the opponent an AND node. Returns true when a forced selfmate
+    // within the current limits was proven; fills rootMoves and its PV.
+    bool selfmate_proof_search();
+    bool selfmate_prove(Position& pos, int depth, int ply, PVMoves& pv);
+    int  selfmate_move_score(const Position& pos, Move move, bool orNode, Move ttMove) const;
+    void selfmate_store(Key key, int winDepth, int failDepth, Move move);
+
+    struct SelfMateTTEntry {
+        Key  key  = 0;
+        Move move = Move::none();
+        int  win  = -1;  // smallest depth at which a forced selfmate was proven
+        int  fail = -1;  // largest depth at which no forced selfmate was found
+    };
+
     LimitsType limits;
 
     usize              pvIdx, pvLast;
@@ -390,6 +408,16 @@ class Worker {
     // Worst Mode: root values are from the opponent's point of view (root maximizes
     // the opponent's best-play score); everything below the root is a normal search.
     bool worstMode = false;
+    // Self-Mate Mode: the root side wants to be checkmated while the opponent
+    // resists. Scores stay from the side-to-move point of view, but being mated
+    // is the goal and a static eval is negated so that a worse position is better.
+    bool  selfMateMode = false;
+    Color selfMateSide = WHITE;
+
+    std::vector<SelfMateTTEntry> selfMateTT;
+    TimePoint                    selfMateDeadline  = 0;
+    u64                          selfMateNodeLimit = 0;
+    bool                         selfMateAborted   = false;
 
     PVMoves lastIterationIdxPV;
 
