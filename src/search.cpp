@@ -1634,7 +1634,7 @@ moves_loop:  // When in check, search starts here
     // must be a mate or a stalemate (just a fail low score if we are in a
     // singular extension search).
     if (!moveCount)
-        bestValue = excludedMove ? alpha : terminal_value(pos, ss->ply, ss->inCheck);
+        bestValue = excludedMove ? alpha : terminal_value(ss->ply, ss->inCheck);
 
     // If there is a move that produces search value greater than alpha,
     // we update the stats of searched moves. A Worst Mode root best move is
@@ -1929,7 +1929,7 @@ Value Search::Worker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta)
         if (ss->inCheck)  // Checkmate!
         {
             assert(!MoveList<ALL>(pos).size());
-            return terminal_value(pos, ss->ply, true);  // Plies to mate from the root
+            return terminal_value(ss->ply, true);  // Plies to mate from the root
         }
 
         // Only check for stalemate under specific conditions
@@ -1979,14 +1979,14 @@ Value Search::Worker::evaluate(const Position& pos) {
 }
 
 // Value of a node without legal moves. Normally checkmate is a loss for the
-// side to move; in Self-Mate Mode only the self-mate side being mated is the
-// goal, while the opponent being mated or a stalemate is a failure (draw score).
-Value Search::Worker::terminal_value(const Position& pos, int ply, bool inCheck) const {
+// side to move. In Self-Mate Mode the value is from the side-to-move's point
+// of view in the zero-sum "is the self-mate side mated?" game: whichever side
+// is mated is the side that got what it wanted, because the opponent's goal is
+// precisely that the self-mate side is not mated. Stalemate remains a draw.
+Value Search::Worker::terminal_value(int ply, bool inCheck) const {
     if (!inCheck)
         return VALUE_DRAW;
-    if (!selfMateMode)
-        return mated_in(ply);
-    return pos.side_to_move() == selfMateSide ? mate_in(ply) : VALUE_DRAW;
+    return selfMateMode ? mate_in(ply) : mated_in(ply);
 }
 
 // Self-Mate Mode is a different game from normal chess: the opponent has to be
@@ -1996,7 +1996,7 @@ Value Search::Worker::terminal_value(const Position& pos, int ply, bool inCheck)
 //
 // Depth is measured in plies. At the root it is always even: the self-mate side
 // moves, the opponent moves, ..., and the self-mate side ends up checkmated.
-bool Search::Worker::selfmate_prove(Position& pos, int depth, int ply, PVMoves& pv) {
+bool Search::Worker::selfmate_prove(Position& pos, int depth, int ply, PVMoves& pv, bool needPv) {
     pv.clear();
 
     ++nodes;
@@ -2016,33 +2016,35 @@ bool Search::Worker::selfmate_prove(Position& pos, int depth, int ply, PVMoves& 
     const bool      inCheck = pos.checkers();
 
     if (moveList.size() == 0)
-    {
-        const bool win = inCheck && pos.side_to_move() == selfMateSide;
-        selfmate_store(pos.key(), win ? 0 : -1, win ? -1 : 0, Move::none());
-        return win;
-    }
+        return inCheck && pos.side_to_move() == selfMateSide;
 
     // Draws are a failure: a selfmate has to end in checkmate.
     if (depth <= 0 || pos.is_draw(ply))
         return false;
 
-    const Key        key = pos.key();
-    SelfMateTTEntry& e   = selfMateTT[key & (selfMateTT.size() - 1)];
-    const bool       hit = e.key == key;
+    const Key        key    = pos.key();
+    const int        rule50 = pos.rule50_count();
+    SelfMateTTEntry& e      = selfMateTT[key & (selfMateTT.size() - 1)];
+    const bool       hit    = e.key == key;
 
-    if (hit && e.win >= 0 && e.win <= depth)
+    // A win proven with at least as much 50-move budget is valid here. The
+    // rule50 guard keeps transpositions with a different clock sound.
+    if (hit && e.win >= 0 && e.win <= depth && rule50 <= e.winRule50)
     {
-        // Rebuild the proven line from the stored move so the PV stays complete.
-        if (e.move.is_ok() && pos.legal(e.move))
+        if (!needPv)
+            return true;
+
+        // Rebuild one line from the stored move so the PV stays complete.
+        if (e.winMove.is_ok() && pos.legal(e.winMove))
         {
             PVMoves   childPv;
             StateInfo st;
-            pos.do_move(e.move, st);
-            const bool win = selfmate_prove(pos, depth - 1, ply + 1, childPv);
-            pos.undo_move(e.move);
+            pos.do_move(e.winMove, st);
+            const bool win = selfmate_prove(pos, depth - 1, ply + 1, childPv, true);
+            pos.undo_move(e.winMove);
             if (win)
             {
-                pv.update(e.move, &childPv);
+                pv.update(e.winMove, &childPv);
                 return true;
             }
             if (threads.stop || selfMateAborted)
@@ -2050,10 +2052,16 @@ bool Search::Worker::selfmate_prove(Position& pos, int depth, int ply, PVMoves& 
         }
         // Stale entry: fall through and search normally.
     }
-    else if (hit && e.fail >= depth)
+    else if (hit && e.fail >= depth && rule50 >= e.failRule50)
         return false;
 
     const bool orNode = pos.side_to_move() == selfMateSide;
+
+    // The previous result is the best ordering hint: a winning move at OR
+    // nodes, a refuting reply at AND nodes.
+    Move ttMove = Move::none();
+    if (hit)
+        ttMove = orNode ? e.winMove : (e.failMove.is_ok() ? e.failMove : e.winMove);
 
     struct ScoredMove {
         Move move;
@@ -2063,7 +2071,7 @@ bool Search::Worker::selfmate_prove(Position& pos, int depth, int ply, PVMoves& 
     usize      n = 0;
 
     for (Move m : moveList)
-        ordered[n++] = {m, selfmate_move_score(pos, m, orNode, hit ? e.move : Move::none())};
+        ordered[n++] = {m, selfmate_order_score(pos, m, orNode, ttMove)};
     std::sort(ordered, ordered + n,
               [](const ScoredMove& a, const ScoredMove& b) { return a.score > b.score; });
 
@@ -2075,26 +2083,28 @@ bool Search::Worker::selfmate_prove(Position& pos, int depth, int ply, PVMoves& 
             PVMoves    childPv;
             StateInfo  st;
             pos.do_move(m, st);
-            const bool win = selfmate_prove(pos, depth - 1, ply + 1, childPv);
+            const bool win = selfmate_prove(pos, depth - 1, ply + 1, childPv, needPv);
             pos.undo_move(m);
 
             if (threads.stop || selfMateAborted)
                 return false;
             if (win)
             {
-                pv.update(m, &childPv);
-                selfmate_store(key, depth, -1, m);
+                if (needPv)
+                    pv.update(m, &childPv);
+                selfmate_store_win(key, depth, m, rule50);
                 return true;
             }
         }
 
-        selfmate_store(key, -1, depth, Move::none());
+        selfmate_store_fail(key, depth, Move::none(), rule50);
         return false;
     }
 
     // Opponent (AND) node: every legal reply has to lead to the selfmate.
-    Move   firstMove = Move::none();
+    Move   firstMove    = Move::none();
     PVMoves firstPv;
+    bool   firstPvValid = false;
 
     for (usize i = 0; i < n; ++i)
     {
@@ -2102,74 +2112,116 @@ bool Search::Worker::selfmate_prove(Position& pos, int depth, int ply, PVMoves& 
         PVMoves    childPv;
         StateInfo  st;
         pos.do_move(m, st);
-        const bool win = selfmate_prove(pos, depth - 1, ply + 1, childPv);
+        // Only the first reply is needed to reconstruct one PV line.
+        const bool win = selfmate_prove(pos, depth - 1, ply + 1, childPv, needPv && i == 0);
         pos.undo_move(m);
 
         if (threads.stop || selfMateAborted)
             return false;
         if (!win)
         {
-            selfmate_store(key, -1, depth, Move::none());
+            // Store the escaping reply so the next iteration tries it first.
+            selfmate_store_fail(key, depth, m, rule50);
             return false;
         }
 
-        if (firstMove == Move::none())
+        if (i == 0)
         {
-            firstMove = m;
-            firstPv   = childPv;
+            firstMove    = m;
+            firstPv      = childPv;
+            firstPvValid = needPv;
         }
     }
 
-    pv.update(firstMove, &firstPv);
-    selfmate_store(key, depth, -1, firstMove);
+    if (firstPvValid)
+        pv.update(firstMove, &firstPv);
+    selfmate_store_win(key, depth, firstMove, rule50);
     return true;
 }
 
-int Search::Worker::selfmate_move_score(const Position& pos,
-                                        Move            move,
-                                        bool            orNode,
-                                        Move            ttMove) const {
+int Search::Worker::selfmate_order_score(Position& pos, Move move, bool orNode, Move ttMove) {
     if (move == ttMove)
-        return 1 << 24;
+        return 1 << 30;
 
     const bool check   = pos.gives_check(move);
     const bool capture = pos.capture_stage(move);
 
-    // The self-mate side wants to force replies, the opponent wants to escape,
-    // so the two sides get opposite ordering preferences.
+    StateInfo st;
+    pos.do_move(move, st);
+    const int  replies      = int(MoveList<ALL>(pos).size());
+    const bool childInCheck = pos.checkers();
+    pos.undo_move(move);
+
+    // Mobility is the dominant term: both sides want to restrict the
+    // opponent's options, so try the move that leaves the fewest legal replies.
+    constexpr int MOBILITY = 1 << 16;
+    constexpr int BIG      = 1 << 10;
+    constexpr int SMALL    = 1 << 4;
+    constexpr int TERMINAL = 1 << 29;
+
     if (orNode)
-        return (check ? 1 << 20 : 0) + (capture ? 1 << 12 : 0);
-    return (!check ? 1 << 20 : 0) + (!capture ? 1 << 12 : 0);
+    {
+        // The opponent has no move: mated or stalemated, both are failures.
+        if (replies == 0)
+            return -TERMINAL;
+        return -replies * MOBILITY + (check ? BIG : 0) + (capture ? SMALL : 0);
+    }
+
+    // The reply leaves the self-mate side without a move: stalemate is a
+    // refutation and should be tried first, checkmate is not.
+    if (replies == 0)
+        return childInCheck ? -TERMINAL : TERMINAL;
+
+    // Both players try to restrict the opponent's options, so the defender
+    // prefers replies that leave the self-mate side with the fewest moves.
+    return -replies * MOBILITY + (capture ? BIG : 0) + (check ? SMALL : 0);
 }
 
-void Search::Worker::selfmate_store(Key key, int winDepth, int failDepth, Move move) {
+void Search::Worker::selfmate_store_win(Key key, int depth, Move move, int rule50) {
     SelfMateTTEntry& e = selfMateTT[key & (selfMateTT.size() - 1)];
 
     if (e.key != key)
     {
-        e.key  = key;
-        e.move = Move::none();
-        e.win  = -1;
-        e.fail = -1;
+        e     = SelfMateTTEntry{};
+        e.key = key;
     }
 
-    if (winDepth >= 0 && (e.win < 0 || winDepth < e.win))
+    if (e.win < 0 || depth < e.win || (depth == e.win && rule50 < e.winRule50))
     {
-        e.win  = winDepth;
-        e.move = move;
+        e.win       = depth;
+        e.winMove   = move;
+        e.winRule50 = rule50;
     }
-    if (failDepth > e.fail)
-        e.fail = failDepth;
+}
+
+void Search::Worker::selfmate_store_fail(Key key, int depth, Move refutation, int rule50) {
+    SelfMateTTEntry& e = selfMateTT[key & (selfMateTT.size() - 1)];
+
+    if (e.key != key)
+    {
+        e     = SelfMateTTEntry{};
+        e.key = key;
+    }
+
+    if (depth > e.fail || (depth == e.fail && rule50 > e.failRule50))
+    {
+        e.fail       = depth;
+        e.failMove   = refutation;
+        e.failRule50 = rule50;
+    }
 }
 
 bool Search::Worker::selfmate_proof_search() {
-    static constexpr usize TT_SIZE = 1 << 18;
+    static constexpr usize TT_SIZE = 1 << 20;
 
-    if (selfMateTT.empty())
-        selfMateTT.resize(TT_SIZE);
-    else
-        for (auto& e : selfMateTT)
-            e = SelfMateTTEntry{};
+    // Keep the proof table across searches of the same side: after a proven
+    // line the opponent has to stay inside the proof tree, so following the
+    // stored wins is enough and the PV is re-proven from a hot table.
+    if (selfMateTT.size() != TT_SIZE || selfMateTTSide != selfMateSide)
+    {
+        selfMateTT.assign(TT_SIZE, SelfMateTTEntry{});
+        selfMateTTSide = selfMateSide;
+    }
 
     selfMateAborted = false;
 
@@ -2177,9 +2229,9 @@ bool Search::Worker::selfmate_proof_search() {
     // something left to pick a move with when no proof is found.
     selfMateDeadline = 0;
     if (limits.movetime)
-        selfMateDeadline = limits.movetime / 2;
+        selfMateDeadline = std::max<TimePoint>(1, limits.movetime / 2);
     else if (limits.use_time_management())
-        selfMateDeadline = main_manager()->tm.optimum() / 2;
+        selfMateDeadline = std::max<TimePoint>(1, main_manager()->tm.optimum() / 2);
 
     // Without a clock, keep depth-only searches interactive. The global node
     // limit still applies to the fallback, so the proof only uses half of it.
@@ -2189,12 +2241,28 @@ bool Search::Worker::selfmate_proof_search() {
     if (limits.mate)
         maxDepth = std::min(maxDepth, 2 * limits.mate);
 
-    // Forcing checks first at the root; waiting moves cannot be ranked statically.
-    std::stable_sort(rootMoves.begin(), rootMoves.end(),
-                     [&](const RootMove& a, const RootMove& b) {
-                         return selfmate_move_score(rootPos, a.pv[0], true, Move::none())
-                              > selfmate_move_score(rootPos, b.pv[0], true, Move::none());
-                     });
+    // Rank root moves by how much they squeeze the opponent. The scores are
+    // precomputed because the comparator must not mutate the position.
+    std::vector<std::pair<int, usize>> rootOrder;
+    rootOrder.reserve(rootMoves.size());
+
+    for (usize i = 0; i < rootMoves.size(); ++i)
+    {
+        const Move m = rootMoves[i].pv[0];
+        const int  s = rootPos.legal(m)
+                       ? selfmate_order_score(rootPos, m, true, Move::none())
+                       : -(1 << 30);
+        rootOrder.emplace_back(s, i);
+    }
+
+    std::stable_sort(rootOrder.begin(), rootOrder.end(),
+                     [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    RootMoves ordered;
+    ordered.reserve(rootMoves.size());
+    for (const auto& entry : rootOrder)
+        ordered.push_back(std::move(rootMoves[entry.second]));
+    rootMoves = std::move(ordered);
 
     for (int d = 2; d <= maxDepth && !threads.stop && !selfMateAborted; d += 2)
     {
@@ -2208,7 +2276,7 @@ bool Search::Worker::selfmate_proof_search() {
             PVMoves   childPv;
             StateInfo st;
             rootPos.do_move(m, st);
-            const bool win = selfmate_prove(rootPos, d - 1, 1, childPv);
+            const bool win = selfmate_prove(rootPos, d - 1, 1, childPv, false);
             rootPos.undo_move(m);
 
             if (threads.stop || selfMateAborted)
@@ -2216,10 +2284,18 @@ bool Search::Worker::selfmate_proof_search() {
             if (!win)
                 continue;
 
+            // Rebuild the PV from the now-hot table; the proof itself is done,
+            // so an abort here only shortens the reported line.
+            PVMoves pvLine;
+            rootPos.do_move(m, st);
+            const bool pvOk = selfmate_prove(rootPos, d - 1, 1, pvLine, true);
+            rootPos.undo_move(m);
+
             RootPVMoves pv;
             pv.push_back(m);
-            for (Move cm : childPv)
-                pv.push_back(cm);
+            if (pvOk)
+                for (Move cm : pvLine)
+                    pv.push_back(cm);
 
             Utility::move_to_front(rootMoves, [m](const RootMove& rm) { return rm.pv[0] == m; });
             rootMoves[0].pv             = pv;

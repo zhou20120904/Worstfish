@@ -375,21 +375,25 @@ class Worker {
     Value evaluate(const Position&);
 
     // Value of a node without legal moves: checkmate, or stalemate/draw.
-    Value terminal_value(const Position& pos, int ply, bool inCheck) const;
+    Value terminal_value(int ply, bool inCheck) const;
 
     // Self-Mate Mode: dedicated AND/OR proof search. The self-mate side is an
     // OR node, the opponent an AND node. Returns true when a forced selfmate
     // within the current limits was proven; fills rootMoves and its PV.
     bool selfmate_proof_search();
-    bool selfmate_prove(Position& pos, int depth, int ply, PVMoves& pv);
-    int  selfmate_move_score(const Position& pos, Move move, bool orNode, Move ttMove) const;
-    void selfmate_store(Key key, int winDepth, int failDepth, Move move);
+    bool selfmate_prove(Position& pos, int depth, int ply, PVMoves& pv, bool needPv);
+    int  selfmate_order_score(Position& pos, Move move, bool orNode, Move ttMove);
+    void selfmate_store_win(Key key, int depth, Move move, int rule50);
+    void selfmate_store_fail(Key key, int depth, Move refutation, int rule50);
 
     struct SelfMateTTEntry {
-        Key  key  = 0;
-        Move move = Move::none();
-        int  win  = -1;  // smallest depth at which a forced selfmate was proven
-        int  fail = -1;  // largest depth at which no forced selfmate was found
+        Key  key        = 0;
+        Move winMove    = Move::none();
+        Move failMove   = Move::none();
+        int  win        = -1;  // smallest depth at which a forced selfmate was proven
+        int  fail       = -1;  // largest depth at which no forced selfmate was found
+        int  winRule50  = 0;   // reusable when current rule50 <= winRule50
+        int  failRule50 = 0;   // reusable when current rule50 >= failRule50
     };
 
     LimitsType limits;
@@ -415,6 +419,7 @@ class Worker {
     Color selfMateSide = WHITE;
 
     std::vector<SelfMateTTEntry> selfMateTT;
+    Color                        selfMateTTSide   = COLOR_NB;
     TimePoint                    selfMateDeadline  = 0;
     u64                          selfMateNodeLimit = 0;
     bool                         selfMateAborted   = false;
