@@ -283,6 +283,8 @@ bool Search::Worker::iterative_deepening() {
 
     SearchManager* mainThread = (is_mainthread() ? main_manager() : nullptr);
 
+    worstMode = bool(options["Worst Mode"]);
+
     PVMoves pv;
 
     RootPVMoves lastBestMovePV;
@@ -392,7 +394,8 @@ bool Search::Worker::iterative_deepening() {
             seekMate = std::abs(rootMoves[pvIdx].score) >= 750 + 220000 / (rootDepth * rootDepth);
 
             // Adjust optimism based on root move's averageScore
-            optimism[us]  = 114 * avg / (std::abs(avg) + 85);
+            Value avgUs   = worstMode ? -avg : avg;
+            optimism[us]  = 114 * avgUs / (std::abs(avgUs) + 85);
             optimism[~us] = -optimism[us];
 
             // Start with a small aspiration window and, in the case of a fail
@@ -742,6 +745,9 @@ Value Search::Worker::search(
     constexpr bool PvNode   = nodeType != NonPV;
     constexpr bool rootNode = nodeType == Root;
     const bool     allNode  = !(PvNode || cutNode);
+    // Worst Mode root: alpha/beta/values are from the opponent's point of view
+    // and children are searched without negation. Below the root nothing changes.
+    const bool flipRoot = rootNode && worstMode;
 
     // Dive into quiescence search when the depth reaches zero
     if (depth <= 0)
@@ -1075,7 +1081,7 @@ Value Search::Worker::search(
         }
     }
 
-    improving |= ss->staticEval >= beta;
+    improving |= (flipRoot ? -ss->staticEval : ss->staticEval) >= beta;
 
     // Step 11. Internal iterative reductions
     // At sufficient depth, reduce depth for PV/Cut nodes without a TTMove.
@@ -1087,7 +1093,8 @@ Value Search::Worker::search(
     // If we have a good enough capture (or queen promotion) and a reduced search
     // returns a value much above beta, we can (almost) safely prune the previous move.
     probCutBeta = beta + 241 - 64 * improving;
-    if (depth >= 3 && !is_decisive(beta) && !(is_valid(ttData.value) && ttData.value < probCutBeta))
+    if (!flipRoot && depth >= 3 && !is_decisive(beta)
+        && !(is_valid(ttData.value) && ttData.value < probCutBeta))
     {
         assert(probCutBeta < VALUE_INFINITE && probCutBeta > beta);
 
@@ -1131,8 +1138,9 @@ moves_loop:  // When in check, search starts here
 
     // Step 13. A small ProbCut idea
     probCutBeta = beta + 428;
-    if ((ttData.bound & BOUND_LOWER) && ttData.depth >= depth - 4 && ttData.value >= probCutBeta
-        && !is_decisive(beta) && is_valid(ttData.value) && !is_decisive(ttData.value) && !seekMate)
+    if (!flipRoot && (ttData.bound & BOUND_LOWER) && ttData.depth >= depth - 4
+        && ttData.value >= probCutBeta && !is_decisive(beta) && is_valid(ttData.value)
+        && !is_decisive(ttData.value) && !seekMate)
         return probCutBeta;
 
     const PieceToHistory* contHist[] = {
@@ -1341,7 +1349,8 @@ moves_loop:  // When in check, search starts here
 
         // Decrease reduction for PvNodes (*Scaler)
         if (ss->ttPv)
-            r -= 3023 + PvNode * 1004 + (ttData.value > alpha) * 885
+            r -= 3023 + PvNode * 1004
+               + ((flipRoot && is_valid(ttData.value) ? -ttData.value : ttData.value) > alpha) * 885
                + (ttData.depth >= depth) * (816 + cutNode * 940);
 
         // Base reduction offset to compensate for other tweaks
@@ -1379,7 +1388,7 @@ moves_loop:  // When in check, search starts here
         r -= ss->statScore * 439 / 4096;
 
         if (!capture && !is_decisive(alpha))
-            r += 3 * std::clamp(alpha - eval, -64, 96);
+            r += 3 * std::clamp(alpha - (flipRoot ? -eval : eval), -64, 96);
 
         // Scale up reductions for expected ALL nodes
         if (allNode)
@@ -1399,8 +1408,11 @@ moves_loop:  // When in check, search starts here
             Depth d =
               std::max(1, newDepth + std::min(-r / 1024, ss->ply < 2 * rootDepth ? 2 : 0)) + PvNode;
 
+            // At a Worst Mode root, scout searches are expected to fail low in the
+            // child's own perspective, so the child is an all-node.
             ss->reduction = newDepth - d;
-            value         = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, d, true);
+            value         = flipRoot ? search<NonPV>(pos, ss + 1, alpha, alpha + 1, d, false)
+                                     : -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, d, true);
             ss->reduction = 0;
 
             // Do a full-depth search when reduced LMR search fails high
@@ -1415,7 +1427,9 @@ moves_loop:  // When in check, search starts here
                 newDepth += doDeeperSearch - doShallowerSearch;
 
                 if (newDepth > d)
-                    value = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, newDepth, !cutNode);
+                    value = flipRoot
+                            ? search<NonPV>(pos, ss + 1, alpha, alpha + 1, newDepth, false)
+                            : -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, newDepth, !cutNode);
 
                 // Post LMR continuation history updates
                 update_continuation_histories(ss, movedPiece, move.to_sq(), 1334);
@@ -1430,8 +1444,10 @@ moves_loop:  // When in check, search starts here
                 r += 1127;
 
             // If expected reduction is high, we reduce search depth here
-            value = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha,
-                                   newDepth - (r > 5234) - (r > 5487 && newDepth > 2), !cutNode);
+            Depth fullDepth = newDepth - (r > 5234) - (r > 5487 && newDepth > 2);
+            value           = flipRoot
+                              ? search<NonPV>(pos, ss + 1, alpha, alpha + 1, fullDepth, false)
+                              : -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, fullDepth, !cutNode);
         }
 
         // Step 20. For PV nodes only, do a full PV search on the first move
@@ -1450,7 +1466,8 @@ moves_loop:  // When in check, search starts here
                     || ttData.depth > 1))
                 newDepth = std::max(newDepth, 1);
 
-            value = -search<PV>(pos, ss + 1, -beta, -alpha, newDepth, false);
+            value = flipRoot ? search<PV>(pos, ss + 1, alpha, beta, newDepth, false)
+                             : -search<PV>(pos, ss + 1, -beta, -alpha, newDepth, false);
         }
 
         // Step 21. Undo move
@@ -1597,11 +1614,13 @@ moves_loop:  // When in check, search starts here
         bestValue = excludedMove ? alpha : ss->inCheck ? mated_in(ss->ply) : VALUE_DRAW;
 
     // If there is a move that produces search value greater than alpha,
-    // we update the stats of searched moves.
+    // we update the stats of searched moves. A Worst Mode root best move is
+    // deliberately bad, so it must not train the move-ordering histories.
     else if (bestMove)
     {
-        update_all_stats(pos, ss, *this, bestMove, prevSq, quietsSearched, capturesSearched, depth,
-                         ttData.move, PvNode);
+        if (!flipRoot)
+            update_all_stats(pos, ss, *this, bestMove, prevSq, quietsSearched, capturesSearched,
+                             depth, ttData.move, PvNode);
         if (!PvNode)
             ttMoveHistory << (bestMove == ttData.move ? 918 : -747);
     }
@@ -1651,7 +1670,7 @@ moves_loop:  // When in check, search starts here
 
     // Step 24. Write gathered information in transposition table. Note that the
     // static evaluation is saved as it was before correction history.
-    if (!excludedMove && !(rootNode && pvIdx))
+    if (!excludedMove && !(rootNode && pvIdx) && !flipRoot)
         ttWriter.write(posKey, value_to_tt(bestValue, ss->ply), ss->ttPv,
                        bestValue >= beta    ? BOUND_LOWER
                        : PvNode && bestMove ? BOUND_EXACT
@@ -1661,7 +1680,7 @@ moves_loop:  // When in check, search starts here
 
     // Adjust correction history if the best move is not a capture and
     // the error direction matches whether we are above/below bounds.
-    if (!ss->inCheck && !(bestMove && pos.capture(bestMove))
+    if (!flipRoot && !ss->inCheck && !(bestMove && pos.capture(bestMove))
         && (bestValue > ss->staticEval) == bool(bestMove))
     {
         auto bonus =
@@ -2341,13 +2360,17 @@ void SearchManager::output_pv(Search::Worker&           worker,
         if (!pv.empty())
             pv.pop_back();
 
+        // Worst Mode root scores are from the opponent's point of view
+        if (worker.worstMode)
+            v = -v;
+
         auto wdl = worker.options["UCI_ShowWDL"] ? UCIEngine::wdl(v, pos) : "";
 
         // Scores cannot be both exact and inexact
         assert(!(rootMoves[i].inexactLower && rootMoves[i].inexactUpper));
-        auto bound = rootMoves[i].inexactLower ? "lowerbound"
-                   : rootMoves[i].inexactUpper ? "upperbound"
-                                               : "";
+        bool lower = worker.worstMode ? rootMoves[i].inexactUpper : rootMoves[i].inexactLower;
+        bool upper = worker.worstMode ? rootMoves[i].inexactLower : rootMoves[i].inexactUpper;
+        auto bound = lower ? "lowerbound" : upper ? "upperbound" : "";
 
         InfoFull info;
 

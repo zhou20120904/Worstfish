@@ -319,6 +319,20 @@ void ThreadPool::start_thinking(const OptionsMap&  options,
 
     Tablebases::Config tbConfig = Tablebases::rank_root_moves(options, pos, rootMoves);
 
+    // Worst Mode searches only the lowest-ranked TB group, with root scores
+    // from the opponent's point of view.
+    if (options["Worst Mode"] && tbConfig.rootInTB)
+    {
+        for (auto& rm : rootMoves)
+        {
+            rm.tbRank  = -rm.tbRank;
+            rm.tbScore = -rm.tbScore;
+        }
+        std::stable_sort(
+          rootMoves.begin(), rootMoves.end(),
+          [](const Search::RootMove& a, const Search::RootMove& b) { return a.tbRank > b.tbRank; });
+    }
+
     // After ownership transfer 'states' becomes empty, so if we stop the search
     // and call 'go' again without setting a new position states.get() == nullptr.
     assert(states.get() || setupStates.get());

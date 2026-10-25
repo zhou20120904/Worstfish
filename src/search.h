@@ -387,6 +387,9 @@ class Worker {
     RootMoves rootMoves;
     Depth     rootDepth;
     bool      seekMate = false;
+    // Worst Mode: root values are from the opponent's point of view (root maximizes
+    // the opponent's best-play score); everything below the root is a normal search.
+    bool worstMode = false;
 
     PVMoves lastIterationIdxPV;
 

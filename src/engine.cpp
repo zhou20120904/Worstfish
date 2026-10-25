@@ -106,6 +106,14 @@ Engine::Engine(std::optional<std::filesystem::path> path) :
 
     options.add("Skill Level", Option(20, 0, 20));
 
+    // Root scores live in a flipped perspective in Worst Mode, so reset the
+    // previous-search scores that time management carries between moves.
+    options.add(  //
+      "Worst Mode", Option(false, [this](const Option&) {
+          search_clear();
+          return std::nullopt;
+      }));
+
     options.add("Move Overhead", Option(10, 0, 5000));
 
     options.add("nodestime", Option(0, 0, 10000));
