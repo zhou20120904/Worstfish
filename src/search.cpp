@@ -283,6 +283,9 @@ bool Search::Worker::iterative_deepening() {
 
     SearchManager* mainThread = (is_mainthread() ? main_manager() : nullptr);
 
+    worstMode = bool(options["Worst Mode"]);
+    worstSide = rootPos.side_to_move();
+
     PVMoves pv;
 
     RootPVMoves lastBestMovePV;
@@ -327,7 +330,7 @@ bool Search::Worker::iterative_deepening() {
 
     // When playing with strength handicap enable MultiPV search that we will
     // use behind-the-scenes to retrieve a set of possible moves.
-    if (skill.enabled())
+    if (!worstMode && skill.enabled())
         multiPV = std::max(multiPV, usize(4));
 
     multiPV = std::min(multiPV, rootMoves.size());
@@ -392,8 +395,16 @@ bool Search::Worker::iterative_deepening() {
             seekMate = std::abs(rootMoves[pvIdx].score) >= 750 + 220000 / (rootDepth * rootDepth);
 
             // Adjust optimism based on root move's averageScore
-            optimism[us]  = 114 * avg / (std::abs(avg) + 85);
-            optimism[~us] = -optimism[us];
+            if (worstMode)
+            {
+                optimism[us]  = 0;
+                optimism[~us] = 0;
+            }
+            else
+            {
+                optimism[us]  = 114 * avg / (std::abs(avg) + 85);
+                optimism[~us] = -optimism[us];
+            }
 
             // Start with a small aspiration window and, in the case of a fail
             // high/low, enlarge the window progressively.
@@ -573,7 +584,7 @@ bool Search::Worker::iterative_deepening() {
             continue;
 
         // If the skill level is enabled and time is up, pick a sub-optimal best move
-        if (skill.enabled() && skill.time_to_pick(rootDepth))
+        if (!worstMode && skill.enabled() && skill.time_to_pick(rootDepth))
             skill.pick_best(rootMoves, multiPV);
 
         // Do we have time for the next iteration? Can we stop searching now?
@@ -581,8 +592,17 @@ bool Search::Worker::iterative_deepening() {
         {
             u64 nodesEffort = rootMoves[0].effort * 100000 / std::max(u64(1), u64(nodes));
 
-            double fallingEval = (11.48 + 2.30 * (mainThread->bestPreviousAverageScore - bestValue)
-                                  + 1.1 * (mainThread->iterValue[iterIdx] - bestValue))
+            // In Worst Mode scores are opponent-advantage values, so a drop in the
+            // engine's own evaluation means the search score rises. VALUE_INFINITE
+            // marks "no previous estimate" and keeps its original meaning (spend more).
+            const auto scoreDrop = [&](Value previous) -> double {
+                if (previous == VALUE_INFINITE)
+                    return double(VALUE_INFINITE);
+                return worstMode ? double(bestValue) - previous : double(previous) - bestValue;
+            };
+
+            double fallingEval = (11.48 + 2.30 * scoreDrop(mainThread->bestPreviousAverageScore)
+                                  + 1.1 * scoreDrop(mainThread->iterValue[iterIdx]))
                                / 100.0;
             fallingEval = std::clamp(fallingEval, 0.576, 1.728);
 
@@ -642,7 +662,7 @@ bool Search::Worker::iterative_deepening() {
     mainThread->previousTimeReduction = timeReduction;
 
     // If the skill level is enabled, swap the best PV line with the sub-optimal one
-    if (skill.enabled())
+    if (!worstMode && skill.enabled())
         std::swap(rootMoves[0],
                   *std::find(rootMoves.begin(), rootMoves.end(),
                              skill.best ? skill.best : skill.pick_best(rootMoves, multiPV)));
@@ -811,6 +831,9 @@ Value Search::Worker::search(
         // a shorter mate was found upward in the tree then there is no need to search
         // because we will never beat the current alpha. Equal and opposite logic applies
         // when being mated. In either case, return a fail-high score.
+        // In Worst Mode all nodes maximize the same opponent-advantage score, so the
+        // reachable range is symmetric and the same bounds apply: no subtree can score
+        // above mate_in(ply + 1) or at or below mated_in(ply).
         alpha = std::max(mated_in(ss->ply), alpha);
         beta  = std::min(mate_in(ss->ply + 1), beta);
         if (alpha >= beta)
@@ -827,7 +850,10 @@ Value Search::Worker::search(
     (ss + 2)->cutoffCnt        = 0;
     (ss + 1)->priorNMPFailHigh = 0;
 
-    const auto correctionValue = correction_value(*this, pos, ss);
+    // Correction history assumes search values refine the static evaluation along
+    // one side-to-move perspective. In Worst Mode engine nodes deliberately steer
+    // towards low values, so learned corrections would saturate and bias the eval.
+    const auto correctionValue = worstMode ? 0 : correction_value(*this, pos, ss);
 
     // Step 4. Transposition table lookup
     excludedMove                   = ss->excludedMove;
@@ -877,9 +903,11 @@ Value Search::Worker::search(
     // check at our previous move we go back until we weren't in check) and is
     // false otherwise. The improving flag is used in various pruning heuristics.
     // Similarly, opponentWorsening is true if our static evaluation is better
-    // for us than at the last ply.
+    // for us than at the last ply. In Worst Mode both evaluations already live
+    // in the same perspective, so no sign inversion is needed there.
     improving         = ss->staticEval > (ss - 2)->staticEval;
-    opponentWorsening = ss->staticEval > -(ss - 1)->staticEval;
+    opponentWorsening = worstMode ? ss->staticEval > (ss - 1)->staticEval
+                                  : ss->staticEval > -(ss - 1)->staticEval;
 
     // Hindsight adjustment of reductions based on static evaluation difference
     if (priorReduction >= 3 && !opponentWorsening)
@@ -924,7 +952,10 @@ Value Search::Worker::search(
                     if (!is_valid(ttDataNext.value))
                         return ttData.value;
 
-                    if ((ttData.value >= beta) == (-ttDataNext.value >= beta))
+                    // In normal negamax the child score is from the opponent's
+                    // perspective; in Worst Mode both scores share one perspective.
+                    const Value nextFromHere = worstMode ? ttDataNext.value : -ttDataNext.value;
+                    if ((ttData.value >= beta) == (nextFromHere >= beta))
                         return ttData.value;
                 }
                 else
@@ -1012,7 +1043,7 @@ Value Search::Worker::search(
 
     // Step 8. Razoring
     // If eval is really low, skip search entirely and return the qsearch value
-    if (allNode && eval < alpha - 342 * depth && !seekMate)
+    if (!worstMode && allNode && eval < alpha - 342 * depth && !seekMate)
         return qsearch<NonPV>(pos, ss, alpha, beta);
 
     // Step 9. Futility pruning: child node
@@ -1032,7 +1063,9 @@ Value Search::Worker::search(
     }
 
     // Step 10. Null move search with verification search
-    if (cutNode
+    // Disabled in Worst Mode: giving the opponent a free move increases the
+    // opponent-advantage score, so the usual fail-high premise is inverted.
+    if (!worstMode && cutNode
         && ss->staticEval + 50 * ss->priorNMPFailHigh >= beta - 13 * depth - 47 * improving + 365
         && !excludedMove && pos.non_pawn_material(us) && ss->ply >= nmpMinPly && beta >= -2000)
     {
@@ -1043,7 +1076,7 @@ Value Search::Worker::search(
         R -= seekMate * R / 2;
         do_null_move(pos, st, ss);
 
-        Value nullValue = -search<NonPV>(pos, ss + 1, -beta, -beta + 1, depth - R, false);
+        Value nullValue = search_child<NonPV>(pos, ss + 1, beta - 1, beta, depth - R, false);
 
         undo_null_move(pos);
 
@@ -1087,7 +1120,8 @@ Value Search::Worker::search(
     // If we have a good enough capture (or queen promotion) and a reduced search
     // returns a value much above beta, we can (almost) safely prune the previous move.
     probCutBeta = beta + 241 - 64 * improving;
-    if (depth >= 3 && !is_decisive(beta) && !(is_valid(ttData.value) && ttData.value < probCutBeta))
+    if (!worstMode && depth >= 3 && !is_decisive(beta)
+        && !(is_valid(ttData.value) && ttData.value < probCutBeta))
     {
         assert(probCutBeta < VALUE_INFINITE && probCutBeta > beta);
 
@@ -1106,12 +1140,12 @@ Value Search::Worker::search(
 
             do_move(pos, move, st, pos.gives_check(move), capture, ss);
             // Perform a preliminary qsearch to verify that the move holds
-            value = -qsearch<NonPV>(pos, ss + 1, -probCutBeta, -probCutBeta + 1);
+            value = qsearch_child<NonPV>(pos, ss + 1, probCutBeta - 1, probCutBeta);
 
             // If the qsearch held, perform the regular search
             if (value >= probCutBeta && probCutDepth > 0)
-                value = -search<NonPV>(pos, ss + 1, -probCutBeta, -probCutBeta + 1, probCutDepth,
-                                       !cutNode);
+                value = search_child<NonPV>(pos, ss + 1, probCutBeta - 1, probCutBeta,
+                                            probCutDepth, !cutNode);
 
             undo_move(pos, move);
 
@@ -1130,9 +1164,12 @@ Value Search::Worker::search(
 moves_loop:  // When in check, search starts here
 
     // Step 13. A small ProbCut idea
+    // This is a plain TT lower-bound fail-high shortcut, which does not rely on
+    // the opponent lowering the score, so it is valid in Worst Mode as well.
     probCutBeta = beta + 428;
-    if ((ttData.bound & BOUND_LOWER) && ttData.depth >= depth - 4 && ttData.value >= probCutBeta
-        && !is_decisive(beta) && is_valid(ttData.value) && !is_decisive(ttData.value) && !seekMate)
+    if ((ttData.bound & BOUND_LOWER) && ttData.depth >= depth - 4
+        && ttData.value >= probCutBeta && !is_decisive(beta) && is_valid(ttData.value)
+        && !is_decisive(ttData.value) && !seekMate)
         return probCutBeta;
 
     const PieceToHistory* contHist[] = {
@@ -1191,10 +1228,17 @@ moves_loop:  // When in check, search starts here
 
         // Step 15. Pruning at shallow depths.
         // Depth conditions are important for mate finding.
+        // In Worst Mode both sides maximize the same opponent-advantage score, so
+        // material terms have to be taken from that fixed perspective: an engine
+        // node helps itself by losing material, which inverts the capture
+        // futility/SEE signs. Only quiet-move futility is left out there, because
+        // the static eval is not an upper bound on the cooperative value.
         if (!rootNode && pos.non_pawn_material(us) && !is_loss(bestValue))
         {
+            const int persp = worstMode && us == worstSide ? -1 : 1;
+
             // Skip quiet moves if movecount exceeds our threshold
-            if (moveCount >= (3 + depth * depth) / (2 - improving))
+            if (!worstMode && moveCount >= (3 + depth * depth) / (2 - improving))
                 mp.skip_quiet_moves();
 
             // Reduced depth of the next LMR search
@@ -1209,7 +1253,7 @@ moves_loop:  // When in check, search starts here
                 if (!givesCheck && lmrDepth < 8)
                 {
                     Value futilityValue = ss->staticEval + 234 + 247 * lmrDepth
-                                        + PieceValue[capturedPiece] + 134 * captHist / 1024;
+                                        + persp * PieceValue[capturedPiece] + 134 * captHist / 1024;
 
                     if (futilityValue <= alpha)
                         continue;
@@ -1217,9 +1261,11 @@ moves_loop:  // When in check, search starts here
 
                 // SEE based pruning for captures and checks.
                 // Avoid pruning sacrifices of our last piece for stalemate.
-                int margin = 177 * depth + captHist * 34 / 1024;
+                int        margin = 177 * depth + captHist * 34 / 1024;
+                const bool seeBad = persp > 0 ? !pos.see_ge(move, -margin)
+                                              : pos.see_ge(move, margin + 1);
                 if ((alpha >= VALUE_DRAW || pos.non_pawn_material(us) != PieceValue[movedPiece])
-                    && !pos.see_ge(move, -margin))
+                    && seeBad)
                     continue;
             }
             else if (!ss->followPV || !PvNode)
@@ -1241,8 +1287,10 @@ moves_loop:  // When in check, search starts here
                   ss->staticEval + 119 * lmrDepth + 90 * (ss->staticEval > alpha) + 164;
 
                 // Futility pruning: parent node
+                // In Worst Mode both sides raise the shared score, so the static
+                // eval is a poor upper estimate and this test is left out.
                 // (*Scaler): Generally, more frequent futility pruning scales well
-                if (!ss->inCheck && lmrDepth < 12 && futilityValue <= alpha)
+                if (!worstMode && !ss->inCheck && lmrDepth < 12 && futilityValue <= alpha)
                 {
                     if (bestValue <= futilityValue && !is_decisive(bestValue)
                         && !is_win(futilityValue))
@@ -1252,8 +1300,12 @@ moves_loop:  // When in check, search starts here
 
                 lmrDepth = std::max(lmrDepth, 0);
 
-                // Prune moves with negative SEE
-                if (!pos.see_ge(move, -23 * lmrDepth * lmrDepth))
+                // Prune moves with negative SEE. At engine nodes a quiet move that
+                // wins material only lowers the shared score, so the sign flips.
+                const bool seeBad =
+                  persp > 0 ? !pos.see_ge(move, -23 * lmrDepth * lmrDepth)
+                            : pos.see_ge(move, 23 * lmrDepth * lmrDepth + 1);
+                if (seeBad)
                     continue;
             }
         }
@@ -1305,7 +1357,7 @@ moves_loop:  // When in check, search starts here
             {
                 ttMoveHistory << -421 - 110 * depth;
 
-                if (!ss->inCheck && value > ss->staticEval)
+                if (!worstMode && !ss->inCheck && value > ss->staticEval)
                 {
                     const int bonus =
                       std::clamp(int(value - ss->staticEval) * 664 / 1024,
@@ -1400,7 +1452,7 @@ moves_loop:  // When in check, search starts here
               std::max(1, newDepth + std::min(-r / 1024, ss->ply < 2 * rootDepth ? 2 : 0)) + PvNode;
 
             ss->reduction = newDepth - d;
-            value         = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, d, true);
+            value         = search_child<NonPV>(pos, ss + 1, alpha, alpha + 1, d, true);
             ss->reduction = 0;
 
             // Do a full-depth search when reduced LMR search fails high
@@ -1415,7 +1467,7 @@ moves_loop:  // When in check, search starts here
                 newDepth += doDeeperSearch - doShallowerSearch;
 
                 if (newDepth > d)
-                    value = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha, newDepth, !cutNode);
+                    value = search_child<NonPV>(pos, ss + 1, alpha, alpha + 1, newDepth, !cutNode);
 
                 // Post LMR continuation history updates
                 update_continuation_histories(ss, movedPiece, move.to_sq(), 1334);
@@ -1430,8 +1482,8 @@ moves_loop:  // When in check, search starts here
                 r += 1127;
 
             // If expected reduction is high, we reduce search depth here
-            value = -search<NonPV>(pos, ss + 1, -(alpha + 1), -alpha,
-                                   newDepth - (r > 5234) - (r > 5487 && newDepth > 2), !cutNode);
+            value = search_child<NonPV>(pos, ss + 1, alpha, alpha + 1,
+                                        newDepth - (r > 5234) - (r > 5487 && newDepth > 2), !cutNode);
         }
 
         // Step 20. For PV nodes only, do a full PV search on the first move
@@ -1450,7 +1502,7 @@ moves_loop:  // When in check, search starts here
                     || ttData.depth > 1))
                 newDepth = std::max(newDepth, 1);
 
-            value = -search<PV>(pos, ss + 1, -beta, -alpha, newDepth, false);
+            value = search_child<PV>(pos, ss + 1, alpha, beta, newDepth, false);
         }
 
         // Step 21. Undo move
@@ -1594,7 +1646,10 @@ moves_loop:  // When in check, search starts here
     // must be a mate or a stalemate (just a fail low score if we are in a
     // singular extension search).
     if (!moveCount)
-        bestValue = excludedMove ? alpha : ss->inCheck ? mated_in(ss->ply) : VALUE_DRAW;
+        bestValue = excludedMove ? alpha
+                 : ss->inCheck ?
+                   raw_score(mated_in(ss->ply), us)
+                 : VALUE_DRAW;
 
     // If there is a move that produces search value greater than alpha,
     // we update the stats of searched moves.
@@ -1661,7 +1716,7 @@ moves_loop:  // When in check, search starts here
 
     // Adjust correction history if the best move is not a capture and
     // the error direction matches whether we are above/below bounds.
-    if (!ss->inCheck && !(bestMove && pos.capture(bestMove))
+    if (!worstMode && !ss->inCheck && !(bestMove && pos.capture(bestMove))
         && (bestValue > ss->staticEval) == bool(bestMove))
     {
         auto bonus =
@@ -1690,6 +1745,12 @@ Value Search::Worker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta)
 
     assert(alpha >= -VALUE_INFINITE && alpha < beta && beta <= VALUE_INFINITE);
     assert(PvNode || (alpha == beta - 1));
+
+    // Worst Mode qsearch trees can be much larger than usual (its move ordering
+    // is inverted), so the main thread must poll the clock here as well to set
+    // the stop flag while it is inside qsearch. Normal mode is left untouched.
+    if (worstMode && is_mainthread())
+        main_manager()->check_time(*this);
 
     // Check if we have an upcoming move that draws by repetition
     if (alpha < VALUE_DRAW && pos.upcoming_repetition(ss->ply))
@@ -1727,6 +1788,11 @@ Value Search::Worker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta)
     if (pos.is_draw(ss->ply) || ss->ply >= MAX_PLY)
         return (ss->ply >= MAX_PLY && !ss->inCheck) ? evaluate(pos) : VALUE_DRAW;
 
+    // Worst Mode qsearch trees can be much larger than usual (its move ordering
+    // is inverted), so poll the stop flag here to respect the time limit.
+    if (worstMode && threads.stop.load(std::memory_order_relaxed))
+        return VALUE_DRAW;
+
     assert(0 <= ss->ply && ss->ply < MAX_PLY);
 
     // Step 3. Transposition table lookup
@@ -1749,7 +1815,7 @@ Value Search::Worker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta)
         bestValue = futilityBase = -VALUE_INFINITE;
     else
     {
-        const auto correctionValue = correction_value(*this, pos, ss);
+        const auto correctionValue = worstMode ? 0 : correction_value(*this, pos, ss);
 
         if (ss->ttHit)
         {
@@ -1816,14 +1882,21 @@ Value Search::Worker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta)
         // Step 6. Pruning
         if (!is_loss(bestValue))
         {
-            // Futility pruning and moveCount pruning
+            // In Worst Mode all nodes maximize the opponent-advantage score, so
+            // an engine-node capture helps by losing material. The material and
+            // SEE terms below are therefore taken from that fixed perspective.
+            const int persp = worstMode && pos.side_to_move() == worstSide ? -1 : 1;
+
             if (!givesCheck && move.to_sq() != prevSq && !is_loss(futilityBase)
                 && move.type_of() != PROMOTION)
             {
-                if (moveCount > 2)
+                // Keeping only the first two captures assumes they are ordered
+                // best-first. At engine nodes the useful captures (sacrifices) are
+                // ordered last, so the move-count shortcut is skipped there.
+                if (moveCount > 2 && persp > 0)
                     continue;
 
-                Value futilityValue = futilityBase + PieceValue[pos.piece_on(move.to_sq())];
+                Value futilityValue = futilityBase + persp * PieceValue[pos.piece_on(move.to_sq())];
 
                 // If static eval + value of piece we are going to capture is
                 // much lower than alpha, we can prune this move.
@@ -1834,7 +1907,9 @@ Value Search::Worker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta)
                 }
 
                 // If static exchange evaluation is low enough, we can prune
-                if (!pos.see_ge(move, alpha - futilityBase))
+                const bool seeBad = persp > 0 ? !pos.see_ge(move, alpha - futilityBase)
+                                              : pos.see_ge(move, futilityBase - alpha + 1);
+                if (seeBad)
                 {
                     bestValue = std::max(bestValue, std::min(alpha, futilityBase));
                     continue;
@@ -1845,15 +1920,16 @@ Value Search::Worker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta)
             if (!capture)
                 continue;
 
-            // Do not search moves with bad enough SEE values
-            if (!pos.see_ge(move, -74))
+            // Do not search moves with bad enough SEE values. At engine nodes
+            // "bad" is inverted: material-winning captures only lower the score.
+            if (persp > 0 ? !pos.see_ge(move, -74) : pos.see_ge(move, 75))
                 continue;
         }
 
         // Step 7. Make and search the move
         do_move(pos, move, st, givesCheck, capture, ss);
 
-        value = -qsearch<nodeType>(pos, ss + 1, -beta, -alpha);
+        value = qsearch_child<nodeType>(pos, ss + 1, alpha, beta);
         undo_move(pos, move);
 
         assert(value > -VALUE_INFINITE && value < VALUE_INFINITE);
@@ -1887,7 +1963,7 @@ Value Search::Worker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta)
         if (ss->inCheck)  // Checkmate!
         {
             assert(!MoveList<ALL>(pos).size());
-            return mated_in(ss->ply);  // Plies to mate from the root
+            return raw_score(mated_in(ss->ply), pos.side_to_move());  // Plies to mate from the root
         }
 
         // Only check for stalemate under specific conditions
@@ -1927,10 +2003,12 @@ TimePoint Search::Worker::elapsed() const {
 
 
 // Evaluate the current position of the game tree, from the point of view of
-// the side to move.
+// the side to move. In Worst Mode this is converted to the fixed "opponent
+// advantage" score space used by the rest of the search.
 Value Search::Worker::evaluate(const Position& pos) {
-    return Eval::evaluate(network[numaAccessToken], pos, accumulatorStack, refreshTable,
-                          optimism[pos.side_to_move()]);
+    Value v = Eval::evaluate(network[numaAccessToken], pos, accumulatorStack, refreshTable,
+                             optimism[pos.side_to_move()]);
+    return raw_score(v, pos.side_to_move());
 }
 
 namespace {
@@ -2310,6 +2388,7 @@ void SearchManager::output_pv(Search::Worker&           worker,
     auto&      pos       = worker.rootPos;
     usize      multiPV   = std::min(usize(worker.options["MultiPV"]), rootMoves.size());
     u64        tbHits    = threads.tb_hits() + (worker.tbConfig.rootInTB ? rootMoves.size() : 0);
+    bool       worstMode = bool(worker.options["Worst Mode"]);
 
     for (usize i = 0; i < multiPV; ++i)
     {
@@ -2329,7 +2408,7 @@ void SearchManager::output_pv(Search::Worker&           worker,
 
         // Potentially correct and extend the PV, and in exceptional cases v.
         // Previous PVs have already been extended. Inexact flags indicate an unreliable PV.
-        if (is_decisive(v) && !is_mate_or_mated(v) && !usePreviousScore
+        if (!worstMode && is_decisive(v) && !is_mate_or_mated(v) && !usePreviousScore
             && (!rootMoves[i].is_inexact() || isTBScore))
             syzygy_extend_pv(worker.options, worker.limits, pos, rootMoves[i], v, multiPV);
 
@@ -2341,20 +2420,26 @@ void SearchManager::output_pv(Search::Worker&           worker,
         if (!pv.empty())
             pv.pop_back();
 
-        auto wdl = worker.options["UCI_ShowWDL"] ? UCIEngine::wdl(v, pos) : "";
+        // Search values are stored in the fixed opponent-advantage perspective
+        // in Worst Mode; UCI scores are always from the engine's point of view.
+        Value vEngine = worstMode ? -v : v;
+
+        auto wdl = worker.options["UCI_ShowWDL"] ? UCIEngine::wdl(vEngine, pos) : "";
 
         // Scores cannot be both exact and inexact
         assert(!(rootMoves[i].inexactLower && rootMoves[i].inexactUpper));
-        auto bound = rootMoves[i].inexactLower ? "lowerbound"
-                   : rootMoves[i].inexactUpper ? "upperbound"
-                                               : "";
+        auto bound = worstMode
+                     ? (rootMoves[i].inexactLower ? "upperbound"
+                        : rootMoves[i].inexactUpper ? "lowerbound" : "")
+                     : (rootMoves[i].inexactLower ? "lowerbound"
+                        : rootMoves[i].inexactUpper ? "upperbound" : "");
 
         InfoFull info;
 
         info.depth    = d;
         info.selDepth = rootMoves[i].selDepth;
         info.multiPV  = i + 1;
-        info.score    = {v, pos};
+        info.score    = {vEngine, pos};
         info.wdl      = wdl;
 
         // TB and previous scores are exact, even though their flags may say otherwise

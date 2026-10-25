@@ -134,6 +134,10 @@ class Engine {
     Search::SearchManager::UpdateContext  updateContext;
     std::function<void(std::string_view)> onVerifyNetwork;
     std::map<NumaIndex, SharedHistories>  sharedHists;
+
+    // Side whose moves Worst Mode tries to make as bad as possible.
+    // COLOR_NB means no previous worst-mode search.
+    Color lastWorstSide = COLOR_NB;
 };
 
 }  // namespace Stockfish

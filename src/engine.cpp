@@ -106,6 +106,13 @@ Engine::Engine(std::optional<std::filesystem::path> path) :
 
     options.add("Skill Level", Option(20, 0, 20));
 
+    options.add(  //
+      "Worst Mode", Option(false, [this](const Option&) {
+          search_clear();
+          lastWorstSide = COLOR_NB;
+          return std::nullopt;
+      }));
+
     options.add("Move Overhead", Option(10, 0, 5000));
 
     options.add("nodestime", Option(0, 0, 10000));
@@ -153,6 +160,16 @@ Engine::perft(const std::string& fen, Depth depth, bool isChess960) {
 void Engine::go(Search::LimitsType& limits) {
     assert(limits.perft == 0);
     verify_network();
+
+    if (options["Worst Mode"])
+    {
+        const Color side = pos.side_to_move();
+        if (lastWorstSide != COLOR_NB && lastWorstSide != side)
+            search_clear();
+        lastWorstSide = side;
+    }
+    else
+        lastWorstSide = COLOR_NB;
 
     threads.start_thinking(options, pos, states, limits);
 }

@@ -361,6 +361,22 @@ class Worker {
     template<NodeType nodeType>
     Value qsearch(Position& pos, Stack* ss, Value alpha, Value beta);
 
+    // Child searches. In normal mode these are ordinary negamax calls. In Worst
+    // Mode scores share a single fixed perspective, so the window is not mirrored
+    // and the returned value is not negated.
+    template<NodeType nodeType>
+    Value search_child(Position& pos, Stack* ss, Value alpha, Value beta, Depth depth,
+                       bool cutNode) {
+        return worstMode ? search<nodeType>(pos, ss, alpha, beta, depth, cutNode)
+                         : -search<nodeType>(pos, ss, -beta, -alpha, depth, cutNode);
+    }
+
+    template<NodeType nodeType>
+    Value qsearch_child(Position& pos, Stack* ss, Value alpha, Value beta) {
+        return worstMode ? qsearch<nodeType>(pos, ss, alpha, beta)
+                         : -qsearch<nodeType>(pos, ss, -beta, -alpha);
+    }
+
     int reduction(bool i, Depth d, int mn) const;
 
     // Pointer to the search manager, only allowed to be called by the main thread
@@ -373,6 +389,13 @@ class Worker {
     TimePoint elapsed() const;
 
     Value evaluate(const Position&);
+
+    // In Worst Mode the search runs in a fixed "opponent advantage" score space:
+    // positive values always favour the non-worst side. Raw scores are produced
+    // from the side-to-move perspective and therefore need this sign transform.
+    Value raw_score(Value v, Color stm) const {
+        return (worstMode && stm == worstSide) ? -v : v;
+    }
 
     LimitsType limits;
 
@@ -387,6 +410,8 @@ class Worker {
     RootMoves rootMoves;
     Depth     rootDepth;
     bool      seekMate = false;
+    bool      worstMode = false;
+    Color     worstSide = WHITE;
 
     PVMoves lastIterationIdxPV;
 

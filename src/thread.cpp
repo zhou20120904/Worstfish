@@ -317,7 +317,12 @@ void ThreadPool::start_thinking(const OptionsMap&  options,
         for (const auto& m : MoveList<ALL>(pos))
             rootMoves.emplace_back(m);
 
-    Tablebases::Config tbConfig = Tablebases::rank_root_moves(options, pos, rootMoves);
+    // Worst Mode uses a fixed score perspective, while tablebases return scores
+    // relative to the side to move, so root ranking (and in-search probing via
+    // the returned cardinality) is disabled there.
+    Tablebases::Config tbConfig = options["Worst Mode"]
+                                  ? Tablebases::Config{}
+                                  : Tablebases::rank_root_moves(options, pos, rootMoves);
 
     // After ownership transfer 'states' becomes empty, so if we stop the search
     // and call 'go' again without setting a new position states.get() == nullptr.
